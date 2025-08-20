@@ -300,7 +300,7 @@ with tab4:
 
         # Exposure on 600-scale: (Count / lineups) * 600
         L = max(len(lus), 1)
-        summary["Exposure (600)"] = (summary["Count"] / L) * 600
+        summary["Exposure"] = (summary["Count"] / L) * 100
 
         # Differences (if PO present)
         if "PO%" in summary.columns:
@@ -327,6 +327,7 @@ with tab4:
         )
     else:
         st.info("No lineups built yet.")
+
 
 
 
