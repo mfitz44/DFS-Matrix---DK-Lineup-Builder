@@ -16,7 +16,7 @@ if not uploaded_file:
 df_raw = pd.read_csv(uploaded_file)
 
 # -------------------------------
-# Normalize / Shim the scorecard
+# Normalize / Shim the scorecard (NO RESCALING to 100 — always 600-slot scale)
 # -------------------------------
 # 1) Ensure Name column
 if "Name" not in df_raw and "Player" in df_raw:
@@ -41,33 +41,21 @@ if "Ceiling" not in df_raw:
     if "RG_ceil" in df_raw:
         df_raw["Ceiling"] = df_raw["RG_ceil"]
     else:
-        # fallback if RG_ceil absent: try to synthesize from projection/floor
         if "RG_fpts" in df_raw and "RG_floor" in df_raw:
             df_raw["Ceiling"] = df_raw["RG_fpts"] + (df_raw["RG_fpts"] - df_raw["RG_floor"]).clip(lower=0)
         else:
             df_raw["Ceiling"] = np.nan
 
-# 5) Coerce to numerics where needed
+# 5) Coerce to numerics where needed (keep 600-scale values)
 for c in ["GTO_Ownership%","Projected_Ownership%","Ceiling","Salary","RealScore","Leverage_%"]:
     if c in df_raw:
         df_raw[c] = pd.to_numeric(df_raw[c], errors="coerce")
 
-# 6) Rescale 600-slot ownerships to 0–100 if necessary (builder uses % of lineups)
-def _maybe_to_percent(s: pd.Series) -> pd.Series:
-    if s is None or s.isna().all():
-        return s
-    s_sum = s.fillna(0).sum()
-    # If totals look like ~600 (slot-based), convert to ~100 scale
-    return (s / 6.0) if s_sum > 200 else s
-
-df_raw["GTO_Ownership%"]       = _maybe_to_percent(df_raw.get("GTO_Ownership%", pd.Series(dtype=float)))
-df_raw["Projected_Ownership%"] = _maybe_to_percent(df_raw.get("Projected_Ownership%", pd.Series(dtype=float)))
-
-# 7) Ensure PlayerID is string (needed for DK export)
+# 6) Ensure PlayerID is string (needed for DK export)
 if "PlayerID" in df_raw:
     df_raw["PlayerID"] = df_raw["PlayerID"].astype(str)
 
-# 8) Minimal presence check
+# 7) Minimal presence check
 required = ["Name","Salary","GTO_Ownership%","Ceiling"]
 missing = [c for c in required if c not in df_raw.columns]
 if missing:
@@ -79,7 +67,7 @@ if missing:
 # -------------------------------
 df_pool = df_raw.dropna(subset=["Name","Salary","GTO_Ownership%"]).reset_index(drop=True)
 
-# Sidebar — old rules as toggles
+# Sidebar — rules & settings
 st.sidebar.header("Rules & Settings")
 total_lineups = st.sidebar.slider("Number of Lineups", 1, 150, 150)
 
@@ -96,16 +84,16 @@ min_sal, max_sal = st.sidebar.slider(
 )
 enforce_salary = st.sidebar.checkbox("Enforce Salary Range", True)
 
-# Exposure cap
+# Exposure cap (percent of lineups)
 enforce_cap = st.sidebar.checkbox("Enforce Exposure Cap", False)
-max_exposure_pct = st.sidebar.slider("Max Exposure (%)", 1.0, 100.0, 26.5, step=0.5)
+max_exposure_pct = st.sidebar.slider("Max Exposure (% of lineups)", 1.0, 100.0, 26.5, step=0.5)
 
 # Singleton
 enforce_singleton = st.sidebar.checkbox("Enforce Singleton Rule (each included at least once)", False)
 
-# Double-punt
+# Double-punt (threshold & max # of those lineups) — threshold on 600-scale PO
 enforce_double = st.sidebar.checkbox("Limit Double-Punt Lineups", False)
-double_threshold = st.sidebar.slider("Punt threshold: Projected_Ownership% <", 0.0, 10.0, 2.75, step=0.1)
+double_threshold = st.sidebar.slider("Punt threshold: Projected_Ownership (600-scale) <", 0.0, 80.0, 16.5, step=0.5)
 max_double = st.sidebar.slider("Max Double-Punt Lineups", 0, 150, 15)
 
 # Tabs
@@ -118,8 +106,10 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # -------------------------------
 with tab1:
     st.subheader("Player Pool (toggle include / set targets)")
-    master_use_gto = st.checkbox("✅ Use GTO for ALL", value=True, help="When ON, any blank targets default to GTO%")
-    # reference table on top
+
+    master_use_gto = st.checkbox("✅ Use GTO for ALL", value=True, help="When ON, any blank targets default to GTO% (600 scale)")
+
+    # Reference table (scorecard view)
     ref_cols = [c for c in ["Name","Salary","PlayerID","GTO_Ownership%","Projected_Ownership%","Ceiling","RealScore","Leverage_%"] if c in df_pool.columns]
     with st.expander("Reference: full scorecard columns", expanded=False):
         st.dataframe(df_pool[ref_cols], use_container_width=True)
@@ -133,16 +123,16 @@ with tab1:
             use_gto = st.checkbox("Use", value=False, key=f"gto_{i}", help="Use row GTO for this golfer")
         with col3:
             tgt_val = row["GTO_Ownership%"] if (use_gto or master_use_gto) else ""
-            target = st.text_input("%", value=f"{tgt_val:.2f}" if tgt_val != "" else "", key=f"tgt_{i}")
+            target = st.text_input("% (600)", value=f"{tgt_val:.2f}" if tgt_val != "" else "", key=f"tgt_{i}")
         with col4:
             st.write(f"💰 ${int(row['Salary'])}")
         with col5:
             info_bits = []
             if "Projected_Ownership%" in df_pool.columns and not np.isnan(row["Projected_Ownership%"]):
-                info_bits.append(f"PO {row['Projected_Ownership%']:.1f}%")
+                info_bits.append(f"PO {row['Projected_Ownership%']:.1f}/600")
             if "Ceiling" in df_pool.columns and not np.isnan(row["Ceiling"]):
                 info_bits.append(f"Ceil {row['Ceiling']:.1f}")
-            if "Leverage_%":  # safe
+            if "Leverage_%":
                 lev = row.get("Leverage_%", np.nan)
                 if not pd.isna(lev):
                     info_bits.append(f"Lev {lev:+.1f}")
@@ -152,10 +142,10 @@ with tab1:
             "PlayerID": row.get("PlayerID", ""),
             "Include": include,
             "UseGTO": use_gto,
-            "Target%": float(target) if str(target).strip() not in ["", "None"] else None,
+            "Target%": float(target) if str(target).strip() not in ["", "None"] else None,  # 600-scale
             "Salary": float(row["Salary"]),
-            "GTO%": float(row["GTO_Ownership%"]),
-            "PO%": float(row["Projected_Ownership%"]) if "Projected_Ownership%" in df_pool.columns else np.nan
+            "GTO%": float(row["GTO_Ownership%"]),  # 600-scale
+            "PO%": float(row["Projected_Ownership%"]) if "Projected_Ownership%" in df_pool.columns and pd.notna(row["Projected_Ownership%"]) else np.nan
         })
     df_controls = pd.DataFrame(controls)
 
@@ -167,9 +157,9 @@ with tab2:
     st.markdown(
         f"- **Lineups:** {total_lineups}\n"
         f"- **Salary Range:** ${min_sal:,} – ${max_sal:,} {'(ENFORCED)' if enforce_salary else '(ignored)'}\n"
-        f"- **Exposure Cap:** {'ON' if enforce_cap else 'OFF'} @ {max_exposure_pct:.1f}%\n"
+        f"- **Exposure Cap:** {'ON' if enforce_cap else 'OFF'} @ {max_exposure_pct:.1f}% of lineups\n"
         f"- **Singleton:** {'ON' if enforce_singleton else 'OFF'}\n"
-        f"- **Double-Punt:** {'ON' if enforce_double else 'OFF'} (PO% < {double_threshold:.2f}%, max {max_double})"
+        f"- **Double-Punt:** {'ON' if enforce_double else 'OFF'} (PO < {double_threshold:.1f} on 600-scale, max {max_double})"
     )
 
 # -------------------------------
@@ -185,7 +175,7 @@ def build_lineups(df_ctrl: pd.DataFrame, num_lineups: int, sal_range: tuple[int,
     sal_map  = dict(zip(pool["Name"], pool["Salary"]))
     po_map   = dict(zip(pool["Name"], pool["PO%"])) if "PO%" in pool.columns else {}
 
-    # weights from Target% or UseGTO or master_use_gto
+    # weights from Target% or UseGTO or master_use_gto (scale-invariant — all 600-scale but normalized here)
     raw_w = []
     for _, r in pool.iterrows():
         if r["Target%"] is not None:
@@ -202,9 +192,8 @@ def build_lineups(df_ctrl: pd.DataFrame, num_lineups: int, sal_range: tuple[int,
     seen = set()
     exposure = {n: 0 for n in names}
     attempts = 0
-    max_attempts = num_lineups * 15000  # generous to find valid uniques
+    max_attempts = num_lineups * 15000
 
-    # helpers
     def lineup_salary(lu_names):
         return int(sum(sal_map[n] for n in lu_names))
 
@@ -218,26 +207,29 @@ def build_lineups(df_ctrl: pd.DataFrame, num_lineups: int, sal_range: tuple[int,
         max_cnt = int(np.floor(num_lineups * (max_exposure_pct/100.0)))
         return all(exposure[n] < max_cnt for n in lu_names)
 
-    # singleton pass (optional)
+    # singleton pass
     if enforce_singleton:
         singles = set(names)
         while singles and len(lineups) < num_lineups and attempts < max_attempts:
             attempts += 1
             seed = singles.pop()
             rest = [n for n in names if n != seed]
-            cand = [seed] + list(np.random.choice(rest, 5, replace=False, p=[weights[names.index(x)] for x in rest]))
+            probs = np.array([weights[names.index(x)] for x in rest])
+            probs = probs/ probs.sum() if probs.sum() > 0 else np.ones_like(probs)/len(probs)
+            cand = [seed] + list(np.random.choice(rest, 5, replace=False, p=probs))
             s = lineup_salary(cand)
             key = tuple(sorted(cand))
-            if (not enforce_salary or (sal_range[0] <= s <= sal_range[1])) and (key not in seen) and under_cap(cand) and (not is_double_punt(cand) or len(lineups) < max_double):
-                # accept
-                seen.add(key)
-                lineups.append({"names":cand, "ids":[ids_map.get(n,"") for n in cand], "salary": s})
-                for n in cand: exposure[n] += 1
+            if (not enforce_salary or (sal_range[0] <= s <= sal_range[1])) and (key not in seen) and under_cap(cand):
+                if not enforce_double or (enforce_double and (not is_double_punt(cand) or sum(1 for lu in lineups if is_double_punt(lu['names'])) < max_double)):
+                    seen.add(key)
+                    lineups.append({"names":cand, "ids":[ids_map.get(n,"") for n in cand], "salary": s})
+                    for n in cand: exposure[n] += 1
 
     # fill remaining
     while len(lineups) < num_lineups and attempts < max_attempts:
         attempts += 1
-        cand = list(np.random.choice(names, 6, replace=False, p=weights))
+        probs = weights
+        cand = list(np.random.choice(names, 6, replace=False, p=probs))
         s = lineup_salary(cand)
         key = tuple(sorted(cand))
         if enforce_salary and not (sal_range[0] <= s <= sal_range[1]): 
@@ -247,14 +239,10 @@ def build_lineups(df_ctrl: pd.DataFrame, num_lineups: int, sal_range: tuple[int,
         if not under_cap(cand):
             continue
         if enforce_double and is_double_punt(cand):
-            # count how many built so far are double punt
-            double_count = sum(
-                1 for lu in lineups if sum(1 for p in lu["names"] if po_map.get(p, np.nan) < double_threshold) >= 2
-            )
+            double_count = sum(1 for lu in lineups if is_double_punt(lu["names"]))
             if double_count >= max_double:
                 continue
 
-        # accept
         seen.add(key)
         lineups.append({"names":cand, "ids":[ids_map.get(n,"") for n in cand], "salary": s})
         for n in cand: exposure[n] += 1
@@ -298,10 +286,9 @@ with tab3:
 # Summary Tab
 # -------------------------------
 with tab4:
-    st.subheader("Exposure Summary")
+    st.subheader("Exposure Summary (600-scale)")
     lus = st.session_state["lineups"]
     if lus:
-        # Count exposures by PlayerID
         all_ids = [pid for lu in lus for pid in lu["ids"]]
         counts = pd.Series(all_ids).value_counts().rename_axis("PlayerID").reset_index(name="Count")
 
@@ -310,11 +297,18 @@ with tab4:
         base = df_controls[base_cols].copy()
 
         summary = base.merge(counts, on="PlayerID", how="left").fillna({"Count":0})
-        # Exposure% scaled to 600 like GTO
-        total_lineups_safe = max(len(lus), 1)
-        summary["Exposure%"] = (summary["Count"] / total_lineups_safe) * 100 / 6 * 600
-        keep = [c for c in ["Name","PlayerID","Salary","GTO%","Target%","PO%","Exposure%"] if c in summary.columns]
-        summary = summary[keep].sort_values("Exposure%", ascending=False)
+
+        # Exposure on 600-scale: (Count / lineups) * 600
+        L = max(len(lus), 1)
+        summary["Exposure (600)"] = (summary["Count"] / L) * 600
+
+        # Differences (if PO present)
+        if "PO%" in summary.columns:
+            summary["Leverage (GTO-PO)"] = summary["GTO%"] - summary["PO%"]
+
+        # Order and show
+        cols_show = [c for c in ["Name","PlayerID","Salary","GTO%","Target%","PO%","Exposure (600)","Leverage (GTO-PO)"] if c in summary.columns]
+        summary = summary[cols_show].sort_values("Exposure (600)", ascending=False)
         st.dataframe(summary, use_container_width=True)
 
         # Lineup salary stats
@@ -333,5 +327,7 @@ with tab4:
         )
     else:
         st.info("No lineups built yet.")
+
+
 
 
