@@ -1,440 +1,296 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import re
 
-st.set_page_config(page_title="DFS Matrix — Targeted Monte Carlo Builder", layout="wide")
-st.title("🏌️ DFS Matrix — Targeted Monte Carlo Builder")
+st.set_page_config(page_title="DFS Matrix — New Lineup Builder (Beta)", layout="wide")
+st.title("🏗️ DFS Matrix — Lineup Builder (Beta)")
 
-# =========================================================
-# Upload scorecard
-# =========================================================
-uploaded_file = st.sidebar.file_uploader("Upload GTO Scorecard CSV", type=["csv"])
-if not uploaded_file:
-    st.info("Upload your scorecard CSV to begin.")
-    st.stop()
-df_raw = pd.read_csv(uploaded_file)
-
-# =========================================================
-# Normalize / Shim the scorecard
-#   - Prefer raw GTO_% (NOT adjusted)
-#   - Keep everything on the 600-slot scale
-# =========================================================
-# 1) Ensure Name column
-if "Name" not in df_raw and "Player" in df_raw:
-    df_raw["Name"] = df_raw["Player"]
-
-# 2) Map GTO (prefer GTO_%). Fall back to Adj_GTO_% only if necessary.
-if "GTO_Ownership%" not in df_raw:
-    if "GTO_%" in df_raw:
-        df_raw["GTO_Ownership%"] = df_raw["GTO_%"]
-    elif "Adj_GTO_%" in df_raw:
-        df_raw["GTO_Ownership%"] = df_raw["Adj_GTO_%"]
-
-# 3) Map PO (public ownership)
-if "Projected_Ownership%" not in df_raw:
-    if "PO_%" in df_raw:
-        df_raw["Projected_Ownership%"] = df_raw["PO_%"]
-    elif "RG_proj_own" in df_raw:
-        df_raw["Projected_Ownership%"] = df_raw["RG_proj_own"]
-
-# 4) Map Ceiling (reference)
-if "Ceiling" not in df_raw:
-    if "RG_ceil" in df_raw:
-        df_raw["Ceiling"] = df_raw["RG_ceil"]
-    elif "RG_fpts" in df_raw and "RG_floor" in df_raw:
-        df_raw["Ceiling"] = df_raw["RG_fpts"] + (df_raw["RG_fpts"] - df_raw["RG_floor"]).clip(lower=0)
-    else:
-        df_raw["Ceiling"] = np.nan
-
-# 5) Coerce numerics
-for c in ["GTO_Ownership%","Projected_Ownership%","Ceiling","Salary","RealScore","Leverage_%"]:
-    if c in df_raw:
-        df_raw[c] = pd.to_numeric(df_raw[c], errors="coerce")
-
-# 6) Ensure 600-slot scale (if user uploads 100-scale, promote ×6)
-def ensure_600(s: pd.Series) -> pd.Series:
-    if s is None or s.isna().all(): return s
-    tot = s.fillna(0).sum()
-    if 80 <= tot <= 120:  # looks like 100-scale totals
-        return s * 6.0
+# --------------------------
+# Helpers
+# --------------------------
+def norm_name(s: str) -> str:
+    if pd.isna(s):
+        return ""
+    s = str(s).strip().lower()
+    s = re.sub(r"\b(jr|sr|iii|ii|iv)\b\.?", "", s)
+    s = re.sub(r"[^a-z0-9\-\s']", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
-df_raw["GTO_Ownership%"]       = ensure_600(df_raw.get("GTO_Ownership%", pd.Series(dtype=float)))
-df_raw["Projected_Ownership%"] = ensure_600(df_raw.get("Projected_Ownership%", pd.Series(dtype=float)))
+def bucket_field_size(n):
+    try:
+        n = int(n)
+    except:
+        return "mid"
+    if n <= 1000:
+        return "small"
+    elif n <= 10000:
+        return "mid"
+    else:
+        return "large"
 
-# 7) Minimal presence check
-required = ["Name","Salary","GTO_Ownership%"]
-missing = [c for c in required if c not in df_raw.columns]
-if missing:
-    st.error(f"Scorecard is missing required columns: {missing}")
+def compute_bgto(df, proj_col="Proj_Points"):
+    x = df[proj_col].fillna(df[proj_col].median()) if proj_col in df.columns else pd.Series(1.0, index=df.index)
+    x = x.clip(lower=0)
+    if x.sum() <= 0:
+        x = pd.Series(1.0, index=df.index)
+    bgto = (x / x.sum()) * 600.0
+    return bgto
+
+def compute_agto(df, bgto_col="BGTO%", own_col="Proj_Ownership%", contest_type="GPP", field_bucket="mid", payout_shape="balanced"):
+    base = 0.35
+    if contest_type == "Double-Up":
+        base = 0.15
+    else:
+        if payout_shape in ["topheavy", "ultratop"]:
+            base += 0.25
+        if field_bucket == "large":
+            base += 0.20
+        elif field_bucket == "small":
+            base -= 0.10
+    base = float(np.clip(base, 0.05, 0.85))
+
+    bgto = df[bgto_col].fillna(0.0)
+    bgto_pct = bgto / 6.0
+
+    if own_col in df.columns:
+        proj_own = df[own_col].fillna(bgto_pct.median())
+    else:
+        proj_own = pd.Series(bgto_pct.median(), index=df.index)
+
+    d = (bgto_pct - proj_own) / 100.0
+    factor = 1.0 - base * d
+    factor = factor.clip(lower=0.1, upper=2.0)
+
+    agto_raw = bgto * factor
+    s = agto_raw.sum()
+    if s > 0:
+        agto = agto_raw * (600.0 / s)
+    else:
+        agto = bgto
+    agto = agto.clip(lower=0.0)
+    return agto
+
+def dedup_and_canonicalize(df):
+    # canonicalize Name, PlayerID, Salary
+    cols = df.columns.tolist()
+    name_cols = [c for c in cols if c.lower() in ["name", "player", "player name", "player_name"]]
+    if name_cols:
+        keep = name_cols[0]
+        if keep != "Name":
+            df.rename(columns={keep: "Name"}, inplace=True)
+        for c in name_cols:
+            if c != "Name":
+                df.drop(columns=[c], inplace=True, errors="ignore")
+    id_cols = [c for c in df.columns if c.lower() in ["playerid", "player id", "dk_id", "dkid", "id"]]
+    if id_cols:
+        keep = id_cols[0]
+        if keep != "PlayerID":
+            df.rename(columns={keep: "PlayerID"}, inplace=True)
+        for c in id_cols:
+            if c != "PlayerID":
+                df.drop(columns=[c], inplace=True, errors="ignore")
+    sal_cols = [c for c in df.columns if c.lower() in ["salary", "dk salary"]]
+    if sal_cols:
+        keep = sal_cols[0]
+        if keep != "Salary":
+            df.rename(columns={keep: "Salary"}, inplace=True)
+        for c in sal_cols:
+            if c != "Salary":
+                df.drop(columns=[c], inplace=True, errors="ignore")
+    return df
+
+def sample_lineups(df, L=50, salary_cap=50000, roster_size=6, use_agto=True, enforce_unique=True):
+    weights_col = "AGTO%" if use_agto and "AGTO%" in df.columns else "BGTO%"
+    w = df[weights_col].fillna(0.0).values
+    if w.sum() <= 0:
+        w = np.ones_like(w)
+    p = w / w.sum()
+    names = df["Name"].tolist()
+    playerid = df["PlayerID"].tolist() if "PlayerID" in df.columns else [""] * len(names)
+    salary = df["Salary"].fillna(0).astype(int).tolist() if "Salary" in df.columns else [0] * len(names)
+
+    lineups = []
+    seen = set()
+    tries = 0
+    max_tries = L * 8000
+    while len(lineups) < L and tries < max_tries:
+        tries += 1
+        if len(names) < roster_size:
+            break
+        idx = np.random.choice(len(names), size=roster_size, replace=False, p=p)
+        c_names = [names[i] for i in idx]
+        c_ids = [playerid[i] for i in idx]
+        c_sal = sum(salary[i] for i in idx)
+        if c_sal > salary_cap:
+            continue
+        key = tuple(sorted(c_ids if any(c_ids) else c_names))
+        if enforce_unique and key in seen:
+            continue
+        seen.add(key)
+        lineups.append({"names": c_names, "ids": c_ids, "salary": int(c_sal)})
+    return lineups
+
+# --------------------------
+# Step 1 — Platform
+# --------------------------
+st.header("Step 1: Platform")
+c1, c2 = st.columns(2)
+with c1:
+    if st.button("DraftKings", type="primary"):
+        st.session_state["site"] = "DraftKings"
+with c2:
+    st.button("FanDuel (Coming Soon)", disabled=True)
+
+if "site" not in st.session_state:
+    st.stop()
+st.success(f"Selected: {st.session_state['site']}")
+
+st.divider()
+
+# --------------------------
+# Step 2 — Sport
+# --------------------------
+st.header("Step 2: Sport")
+cols = st.columns(6)
+with cols[0]:
+    if st.button("Golf", type="primary"):
+        st.session_state["sport"] = "Golf"
+with cols[1]:
+    st.button("MLB (Coming Soon)", disabled=True)
+
+if "sport" not in st.session_state:
+    st.stop()
+st.success(f"Selected: {st.session_state['sport']}")
+st.divider()
+
+# --------------------------
+# Step 3 — Contest Type
+# --------------------------
+st.header("Step 3: Contest Type")
+cc1, cc2 = st.columns(2)
+with cc1:
+    if st.button("GPP", type=("primary" if st.session_state.get("contest_type")=="GPP" else "secondary")):
+        st.session_state["contest_type"] = "GPP"
+with cc2:
+    if st.button("Double-Up", type=("primary" if st.session_state.get("contest_type")=="Double-Up" else "secondary")):
+        st.session_state["contest_type"] = "Double-Up"
+
+if "contest_type" not in st.session_state:
+    st.stop()
+st.success(f"Selected: {st.session_state['contest_type']}")
+st.divider()
+
+# --------------------------
+# Step 4 — Contest Size
+# --------------------------
+st.header("Step 4: Contest Size")
+field_size = st.number_input("Enter field size", min_value=1, value=5000, step=100, format="%d")
+presets = [(50, "1–100"), (500, "100–1,000"), (2500, "1,000–5,000"),
+           (7500, "5,000–10,000"), (25000, "10,000–50,000"), (75000, "50,000+")]
+pcols = st.columns(6)
+for i, (val, label) in enumerate(presets):
+    if pcols[i].button(label):
+        field_size = val
+st.session_state["field_size"] = int(max(1, field_size))
+st.info(f"Field size set to {st.session_state['field_size']:,}")
+st.divider()
+
+# --------------------------
+# Step 5 — Max Entries
+# --------------------------
+st.header("Step 5: Max Entries per User")
+max_entries = st.number_input("Enter max entries per user", min_value=1, value=20, step=1, format="%d")
+mvals = [1,3,20,50,150]
+mcols = st.columns(5)
+for i, val in enumerate(mvals):
+    if mcols[i].button(str(val)):
+        max_entries = val
+st.session_state["max_entries"] = int(max(1, max_entries))
+st.info(f"Max entries set to {st.session_state['max_entries']}")
+st.divider()
+
+# --------------------------
+# Step 6 — Payout Structure
+# --------------------------
+st.header("Step 6: Payout Structure")
+payout_options = {
+    "flat": "Flat (50/50 style)",
+    "balanced": "Balanced (mid-field GPP)",
+    "topheavy": "Top-Heavy (large-field GPP)",
+    "ultratop": "Ultra Top-Heavy (Milly style)"
+}
+cA, cB, cC, cD = st.columns(4)
+if st.session_state["contest_type"] == "Double-Up":
+    st.session_state["payout_shape"] = "flat"
+    with cA: st.button(payout_options["flat"]+" • Selected", disabled=True)
+    with cB: st.button(payout_options["balanced"], disabled=True)
+    with cC: st.button(payout_options["topheavy"], disabled=True)
+    with cD: st.button(payout_options["ultratop"], disabled=True)
+else:
+    for shape, label in payout_options.items():
+        if st.button(label, type=("primary" if st.session_state.get("payout_shape")==shape else "secondary")):
+            st.session_state["payout_shape"] = shape
+st.text_area("Paste custom payout table (optional)", height=100)
+
+if "payout_shape" not in st.session_state:
+    st.stop()
+st.success(f"Payout shape: {payout_options[st.session_state['payout_shape']]}")
+st.divider()
+
+# Defaults
+st.session_state["salary_cap"] = 50000
+st.session_state["roster_size"] = 6
+st.caption("**Contest Summary**")
+st.code(f"{st.session_state['site']} • {st.session_state['sport']} • {st.session_state['contest_type']} • {st.session_state['field_size']:,} entries • Max {st.session_state['max_entries']}/user • {st.session_state['payout_shape']} • Cap $50,000 • Roster 6")
+st.divider()
+
+# --------------------------
+# Step 7 — Upload Prep File
+# --------------------------
+st.header("Step 7: Slate & Data")
+prep_file = st.file_uploader("Upload GTO Scorecard Prep File", type=["csv"])
+if not prep_file:
     st.stop()
 
-# 8) Prepare pool
-df_pool = df_raw.dropna(subset=["Name","Salary","GTO_Ownership%"]).reset_index(drop=True)
-if "PlayerID" in df_pool:
-    df_pool["PlayerID"] = df_pool["PlayerID"].astype(str)
+df = pd.read_csv(prep_file)
+df = dedup_and_canonicalize(df)
+df["BGTO%"] = compute_bgto(df, proj_col="Proj_Points")
+field_bucket = bucket_field_size(st.session_state["field_size"])
+df["AGTO%"] = compute_agto(df, bgto_col="BGTO%", own_col="Proj_Ownership%",
+                           contest_type=st.session_state["contest_type"], field_bucket=field_bucket,
+                           payout_shape=st.session_state["payout_shape"])
 
-# =========================================================
-# Sidebar rules & tuning
-# =========================================================
-st.sidebar.header("Rules & Settings")
-L = st.sidebar.slider("Number of Lineups (L)", 1, 150, 150)
+st.subheader("Player Pool")
+st.caption("All prep columns preserved; BGTO% and AGTO% appended. Sorted by AGTO%.")
+disp_cols = [c for c in df.columns if c not in ["BGTO%","AGTO%"]] + ["BGTO%","AGTO%"]
+st.dataframe(df.sort_values("AGTO%", ascending=False)[disp_cols], use_container_width=True)
 
-# Salary range hard-capped at 50,000
-min_possible = int(df_pool["Salary"].min()) * 6
-max_possible = 50000
-default_min, default_max = 49700, 50000
-default_min = max(min_possible, min(default_min, max_possible))
-default_max = max(min_possible, min(default_max, max_possible))
-sal_min, sal_max = st.sidebar.slider(
-    "Salary Range (DK cap ≤ $50,000)",
-    min_value=min_possible, max_value=max_possible,
-    value=(default_min, default_max), step=100
-)
-enforce_salary = st.sidebar.checkbox("Enforce Salary Range", True)
+st.divider()
+st.header("Build Lineups")
+L = st.slider("Number of Lineups", 1, 150, 50)
+enforce_unique = st.checkbox("Enforce unique lineups", True)
+use_agto = st.checkbox("Use AGTO% weights", True)
 
-# Exposure cap (% of lineups)
-enforce_cap = st.sidebar.checkbox("Enforce Exposure Cap (by % of lineups)", False)
-cap_pct = st.sidebar.slider("Max Exposure (% of lineups)", 1.0, 100.0, 26.5, step=0.5)
-
-# Singleton
-enforce_singleton = st.sidebar.checkbox("Enforce Singleton Rule (each included ≥ 1 lineup)", False)
-
-# Double-punt: threshold is % of lineups; PO_600 / 6
-enforce_double = st.sidebar.checkbox("Limit Double-Punt Lineups", False)
-double_threshold = st.sidebar.slider("Punt threshold: public % of lineups <", 0.0, 10.0, 2.75, step=0.1)
-max_double = st.sidebar.slider("Max Double-Punt Lineups", 0, 150, 15)
-
-st.sidebar.header("Ownership Tolerance")
-tol_pp = st.sidebar.slider("Absolute tolerance (p.p.)", 0.0, 5.0, 2.0, step=0.5)
-rel_tol = st.sidebar.slider("Relative tolerance (% of target)", 0.0, 30.0, 10.0, step=1.0)
-kappa   = st.sidebar.slider("Sampling Tightness (Dirichlet κ)", 20, 400, 120, step=10)
-backoff_limit = st.sidebar.slider("Max backoff rounds (+1 to all bands)", 0, 3, 2)
-
-# =========================================================
-# Tabs
-# =========================================================
-tab1, tab2, tab3, tab4 = st.tabs(["👥 Player Pool","📋 Builder Settings","🎲 Lineups","📊 Summary"])
-
-# =========================================================
-# Player Pool controls
-# =========================================================
-with tab1:
-    st.subheader("Player Pool (toggle include / set targets)")
-    master_use_gto = st.checkbox("✅ Use GTO for ALL (targets on 600 scale)", value=True)
-
-    # Reference table for context
-    ref_cols = [c for c in ["Name","Salary","PlayerID","GTO_Ownership%","Projected_Ownership%","Ceiling","RealScore","Leverage_%"] if c in df_pool.columns]
-    with st.expander("Reference: full scorecard columns", expanded=False):
-        st.dataframe(df_pool[ref_cols], use_container_width=True)
-
-    controls = []
-    for i, row in df_pool.iterrows():
-        c1, c2, c3, c4, c5 = st.columns([3,1,1,1.2,2])
-        with c1:
-            include = st.checkbox(row["Name"], value=True, key=f"inc_{i}")
-        with c2:
-            use_gto = st.checkbox("Use", value=False, key=f"usegto_{i}", help="Use row GTO for this golfer")
-        with c3:
-            tgt_val = row["GTO_Ownership%"] if (use_gto or master_use_gto) else ""
-            target = st.text_input("% (600)", value=f"{tgt_val:.2f}" if tgt_val != "" else "", key=f"tgt_{i}")
-        with c4:
-            st.write(f"💰 ${int(row['Salary'])}")
-        with c5:
-            info_bits = []
-            if "Projected_Ownership%" in df_pool.columns and not np.isnan(row["Projected_Ownership%"]):
-                info_bits.append(f"PO {row['Projected_Ownership%']/6.0:.1f}%")
-            if "Ceiling" in df_pool.columns and not np.isnan(row["Ceiling"]):
-                info_bits.append(f"Ceil {row['Ceiling']:.1f}")
-            lev = row.get("Leverage_%", np.nan)
-            if not pd.isna(lev):
-                info_bits.append(f"Lev {lev:+.1f}")
-            st.caption(" • ".join(info_bits))
-
-        controls.append({
-            "Name": row["Name"],
-            "PlayerID": row.get("PlayerID",""),
-            "Include": include,
-            "UseGTO": use_gto,
-            "Target600": float(target) if str(target).strip() not in ["","None"] else None,
-            "Salary": float(row["Salary"]),
-            "GTO600": float(row["GTO_Ownership%"]),
-            "PO600": float(row["Projected_Ownership%"]) if "Projected_Ownership%" in df_pool.columns and pd.notna(row["Projected_Ownership%"]) else np.nan
-        })
-    df_controls = pd.DataFrame(controls)
-
-# =========================================================
-# Settings echo + preflight feasibility
-# =========================================================
-with tab2:
-    st.subheader("Builder Settings")
-    st.markdown(
-        f"- **Lineups (L):** {L}\n"
-        f"- **Salary Range:** ${sal_min:,}–${sal_max:,} {'(ENFORCED)' if enforce_salary else '(ignored)'}\n"
-        f"- **Exposure Cap:** {'ON' if enforce_cap else 'OFF'} @ {cap_pct:.1f}%\n"
-        f"- **Singleton:** {'ON' if enforce_singleton else 'OFF'}\n"
-        f"- **Double-Punt:** {'ON' if enforce_double else 'OFF'} (PO% of lineups < {double_threshold:.2f}%, max {max_double})\n"
-        f"- **Tolerances:** {tol_pp:.1f} p.p., {rel_tol:.0f}% of target; Dirichlet κ={kappa}; Backoff rounds={backoff_limit}"
-    )
-
-    # Cap feasibility: E * cap_slots >= 6L when cap is on
-    if enforce_cap:
-        pool_size = int(df_controls["Include"].sum()) if "Include" in df_controls else len(df_controls)
-        cap_slots = int(np.floor(L * (cap_pct/100.0)))
-        feasible = (pool_size * cap_slots) >= (6 * L)
-        st.markdown("### Preflight: Exposure Cap Feasibility")
-        st.write(f"Eligible golfers (E): **{pool_size}**  |  Cap slots per golfer: **{cap_slots}**  |  Slots needed: **{6*L}**")
-        if feasible:
-            st.success("Feasible under current exposure cap.")
+if st.button("Run Builder", type="primary"):
+    with st.spinner("Building lineups…"):
+        lineups = sample_lineups(df, L=L, salary_cap=st.session_state["salary_cap"], roster_size=st.session_state["roster_size"],
+                                 use_agto=use_agto, enforce_unique=enforce_unique)
+        if not lineups:
+            st.error("No valid lineups under these settings.")
         else:
-            st.error("Not feasible with current exposure cap and pool size. Increase cap% or include more golfers.")
+            st.success(f"Generated {len(lineups)} lineups.")
+            df_names = pd.DataFrame([{f"P{i+1}": p for i,p in enumerate(lu["names"])} | {"Salary": lu["salary"]} for lu in lineups])
+            st.dataframe(df_names, use_container_width=True)
+            ids_df = pd.DataFrame([lu["ids"] for lu in lineups])
+            st.download_button("📥 Download DraftKings CSV (PlayerIDs)", ids_df.to_csv(index=False, header=False).encode("utf-8"), file_name="dfs_matrix_lineups.csv")
 
-# =========================================================
-# Helper functions (bands, sampling, repair)
-# =========================================================
-def compute_bands(df_ctrl, L, tol_pp, rel_tol, master_use_gto):
-    """Lower/upper lineup counts from targets (600-scale → % of lineups)."""
-    t_pct = []
-    for _, r in df_ctrl.iterrows():
-        if r["Target600"] is not None:
-            t = r["Target600"] / 6.0
-        elif r["UseGTO"] or master_use_gto:
-            t = r["GTO600"] / 6.0
-        else:
-            t = 100.0 / len(df_ctrl)
-        t_pct.append(max(t, 0.0))
-
-    out = df_ctrl[["Name"]].copy()
-    out["t_pct"] = t_pct
-    out["T"] = np.rint(L * out["t_pct"] / 100.0).astype(int)
-
-    A = int(np.rint(L * tol_pp / 100.0))         # absolute p.p. in counts
-    rel = np.ceil((rel_tol/100.0) * out["T"]).astype(int)
-    band = np.maximum(A, np.maximum(rel, 1))
-    out["lower"] = np.maximum(0, out["T"] - band)
-    out["upper"] = np.minimum(L, out["T"] + band)
-    return out
-
-def draw_probs(df_ctrl, master_use_gto, kappa):
-    """Dirichlet draw around normalized target vector (% of lineups)."""
-    base = []
-    for _, r in df_ctrl.iterrows():
-        if r["Target600"] is not None:
-            w = r["Target600"]/6.0
-        elif r["UseGTO"] or master_use_gto:
-            w = r["GTO600"]/6.0
-        else:
-            w = 100.0/len(df_ctrl)
-        base.append(max(w, 1e-8))
-    base = np.array(base, dtype=float)
-    base = base / base.sum()
-    alpha = kappa * base
-    return np.random.dirichlet(alpha)
-
-# =========================================================
-# Persist session state (never lose lineups when switching tabs)
-# =========================================================
-st.session_state.setdefault("lineups", None)
-st.session_state.setdefault("counts", None)
-
-# =========================================================
-# Builder core
-# =========================================================
-def build_lineups(df_ctrl, L, sal_range, bands, attempts_limit, backoff_limit, master_use_gto):
-    pool = df_ctrl[df_ctrl["Include"]].copy()
-    if pool.empty:
-        return [], {}
-
-    names = pool["Name"].tolist()
-    idmap = dict(zip(pool["Name"], pool["PlayerID"])) if "PlayerID" in pool else {}
-    sal   = dict(zip(pool["Name"], pool["Salary"]))
-    po600 = dict(zip(pool["Name"], pool["PO600"])) if "PO600" in pool else {}
-
-    bands = bands.set_index("Name").to_dict(orient="index")
-    counts = {n:0 for n in names}
-    lineups, seen = [], set()
-
-    backoff = 0
-    attempts = 0
-
-    def salary_ok(c):
-        s = int(sum(sal[n] for n in c))
-        return (not enforce_salary) or (sal_range[0] <= s <= sal_range[1])
-
-    def under_cap(c):
-        if not enforce_cap: return True
-        max_cnt = int(np.floor(L * (cap_pct/100.0)))
-        return all(counts[n] < max_cnt for n in c)
-
-    def is_double_punt(c):
-        if not enforce_double: return False
-        low = [n for n in c if (po600.get(n, np.nan)/6.0) < double_threshold]
-        return len(low) >= 2
-
-    def add_lineup(c):
-        lineups.append({
-            "names": c,
-            "ids": [idmap.get(n,"") for n in c],
-            "salary": int(sum(sal[n] for n in c))
-        })
-        for n in c: counts[n] += 1
-
-    # Singleton pass (optional)
-    if enforce_singleton:
-        probs = draw_probs(pool, master_use_gto, kappa)
-        for seed in names:
-            attempts += 1
-            if attempts > attempts_limit: break
-            rest = [n for n in names if n != seed]
-            rest_p = np.array([probs[names.index(r)] for r in rest])
-            rest_p = rest_p/rest_p.sum() if rest_p.sum() > 0 else np.ones_like(rest_p)/len(rest_p)
-            c = [seed] + list(np.random.choice(rest, 5, replace=False, p=rest_p))
-            key = tuple(sorted(c))
-            if key in seen or not salary_ok(c) or not under_cap(c) or is_double_punt(c):
-                continue
-            if any(counts[p] >= bands[p]["upper"] for p in c): 
-                continue
-            seen.add(key); add_lineup(c)
-            if len(lineups) >= L: break
-
-    # Main sampling + backoff
-    while len(lineups) < L and backoff <= backoff_limit:
-        probs = draw_probs(pool, master_use_gto, kappa)
-        tries = 0
-        while len(lineups) < L and attempts < attempts_limit and tries < attempts_limit//5:
-            attempts += 1; tries += 1
-            c = list(np.random.choice(names, 6, replace=False, p=probs))
-            key = tuple(sorted(c))
-            if key in seen or not salary_ok(c) or not under_cap(c) or is_double_punt(c):
-                continue
-            if any(counts[p] >= bands[p]["upper"] for p in c):
-                continue
-            seen.add(key); add_lineup(c)
-        if len(lineups) < L and attempts >= attempts_limit:
-            backoff += 1; attempts = 0
-            for p in bands:
-                bands[p]["upper"] = min(L, bands[p]["upper"] + 1)
-            st.info(f"Backoff: widened bands (+1). {backoff}/{backoff_limit}")
-
-    # ---------- Repair pass (pull over->under into band) ----------
-    if len(lineups) == 0:
-        return lineups, counts
-
-    lu_by_player = {n:set() for n in names}
-    for li, lu in enumerate(lineups):
-        for n in lu["names"]:
-            lu_by_player[n].add(li)
-
-    need = [p for p in names if counts[p] < bands[p]["lower"]]
-    for u in need:
-        needed = bands[u]["lower"] - counts[u]
-        for _ in range(max(0, needed)):
-            swapped = False
-            surplus = [p for p in names if counts[p] > bands[p]["upper"]]
-            for s in surplus:
-                for li in list(lu_by_player[s]):
-                    c = lineups[li]["names"][:]
-                    if u in c or s not in c: 
-                        continue
-                    c2 = c[:]; c2[c2.index(s)] = u
-                    # check constraints
-                    s_new = int(sum(sal[n] for n in c2))
-                    if enforce_salary and not (sal_min <= s_new <= sal_max): continue
-                    if enforce_cap:
-                        max_cnt = int(np.floor(L * (cap_pct/100.0)))
-                        if counts[u] >= max_cnt: continue
-                    if enforce_double:
-                        low = [n for n in c2 if (po600.get(n, np.nan)/6.0) < double_threshold]
-                        new_dp = sum(1 for lu in lineups if len([p for p in lu["names"] if (po600.get(p, np.nan)/6.0) < double_threshold]) >= 2)
-                        if len(low) >= 2 and new_dp >= max_double: continue
-                    # apply
-                    lineups[li]["names"] = c2
-                    lineups[li]["ids"]   = [idmap.get(n,"") for n in c2]
-                    lineups[li]["salary"]= s_new
-                    counts[s] -= 1; counts[u] += 1
-                    lu_by_player[s].remove(li); lu_by_player[u].add(li)
-                    swapped = True
-                    break
-                if swapped: break
-
-    return lineups, counts
-
-# =========================================================
-# Persist session state (never lose lineups when switching tabs)
-# =========================================================
-st.session_state.setdefault("lineups", None)
-st.session_state.setdefault("counts", None)
-
-# =========================================================
-# Run builder
-# =========================================================
-attempts_limit = L * 8000  # per backoff round
-
-with tab3:
-    st.subheader("Lineups")
-    if st.button("Run Builder"):
-        with st.spinner("Sampling and repairing to hit ownership bands…"):
-            bands = compute_bands(df_controls, L, tol_pp, rel_tol, master_use_gto)
-            lineups, counts = build_lineups(
-                df_controls[df_controls["Include"]], L, (sal_min, sal_max),
-                bands, attempts_limit, backoff_limit, master_use_gto
-            )
-            st.session_state["lineups"] = lineups
-            st.session_state["counts"]  = counts
-
-    if st.session_state["lineups"]:
-        df_names = pd.DataFrame(
-            [{f"P{i+1}": p for i,p in enumerate(lu["names"])} | {"Salary": lu["salary"]}
-             for lu in st.session_state["lineups"]]
-        )
-        st.dataframe(df_names, use_container_width=True)
-        ids_df = pd.DataFrame([lu["ids"] for lu in st.session_state["lineups"]])
-        st.download_button(
-            "📥 Download DraftKings CSV (PlayerIDs only)",
-            ids_df.to_csv(index=False, header=False),
-            file_name="dfs_matrix_lineups.csv"
-        )
-    else:
-        st.info("Adjust targets & rules, then click **Run Builder**.")
-
-# =========================================================
-# Summary — true % of lineups (Count / L × 100)
-# =========================================================
-with tab4:
-    st.subheader("Exposure Summary (true % of lineups)")
-    lus = st.session_state["lineups"]
-    counts = st.session_state["counts"]
-    if lus:
-        expo = pd.Series(counts, name="Count").rename_axis("Name").reset_index()
-        expo["Exposure%"] = (expo["Count"] / L) * 100.0
-
-        base = df_controls[["Name","PlayerID","Salary","GTO600","Target600","PO600"]].copy()
-        base = base.rename(columns={
-            "GTO600":"GTO% (600)", "Target600":"Target% (600)", "PO600":"PO% (600)"
-        })
-        summary = base.merge(expo, on="Name", how="left").fillna({"Count":0,"Exposure%":0.0})
-        if "PO% (600)" in summary.columns:
-            summary["Leverage (GTO-PO)"] = summary["GTO% (600)"] - summary["PO% (600)"]
-
-        cols = [c for c in ["Name","PlayerID","Salary","GTO% (600)","Target% (600)","PO% (600)","Exposure%","Leverage (GTO-PO)"] if c in summary.columns]
-        st.dataframe(summary[cols].sort_values("Exposure%", ascending=False), use_container_width=True)
-
-        sals = [lu["salary"] for lu in lus]
-        st.markdown(f"**Average Lineup Salary:** ${np.mean(sals):,.0f}  \n"
-                    f"**Min Salary:** ${np.min(sals):,}  \n"
-                    f"**Max Salary:** ${np.max(sals):,}")
-
-        st.download_button("📥 Download Exposure Summary",
-                           summary[cols].to_csv(index=False),
-                           file_name="dfs_matrix_exposures.csv")
-    else:
-        st.info("No lineups built yet.")
-
-
-
-
-
-
-
-
-
+            names_flat = [n for lu in lineups for n in lu["names"]]
+            expo = pd.Series(names_flat).value_counts(normalize=True)*100
+            expo_df = pd.DataFrame({"Name": expo.index, "Exposure%": expo.values}).merge(
+                df[["Name","PlayerID","Salary","BGTO%","AGTO%","Proj_Ownership%"]] if "Proj_Ownership%" in df.columns else df[["Name","PlayerID","Salary","BGTO%","AGTO%"]],
+                on="Name", how="left"
+            ).sort_values("Exposure%", ascending=False)
+            st.subheader("Exposure Summary")
+            st.dataframe(expo_df, use_container_width=True)
